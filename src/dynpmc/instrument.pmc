@@ -1,0 +1,890 @@
+/*
+Copyright (C) 2010, Parrot Foundation.
+$Id: instrument.pmc 48438 2010-08-12 19:43:40Z khairul $
+
+=head1 NAME
+
+src/dynpmc/instrument.pmc - Instrument
+
+=head1 DESCRIPTION
+
+C<Instrument> is a PMC class that allows dynamic execution introspection
+to be done on a child interpreter.
+
+=head2 Methods
+
+=over 4
+
+=cut
+
+*/
+
+#include "parrot/parrot.h"
+#include "parrot/imcc.h"
+#include "parrot/runcore_api.h"
+#include "parrot/embed.h"
+#include "parrot/opsenum.h"
+
+#include "instrument_private.h"
+
+/* Helper prototypes. */
+probe_list_t *fire_callbacks(PARROT_INTERP, probe_list_t *callbacks, PMC *data, PMC *instr);
+PMC *instrument_pack_params(PARROT_INTERP, const char *format, ...);
+
+/* List related prototypes */
+probe_list_t *probe_list_create_list(PARROT_INTERP);
+probe_node_t *probe_list_create_node(PARROT_INTERP);
+void          probe_list_delete_list(PARROT_INTERP, probe_list_t *list);
+void          probe_list_delete_node(PARROT_INTERP, probe_node_t *node);
+void          probe_list_push(PARROT_INTERP, probe_list_t *list, PMC *item);
+PMC          *probe_list_pop(PARROT_INTERP, probe_list_t *list);
+PMC          *probe_list_remove(PARROT_INTERP, probe_list_t *list, probe_node_t *node);
+probe_node_t *probe_list_find(PARROT_INTERP, probe_list_t *list, PMC *val);
+void          probe_list_append(PARROT_INTERP, probe_list_t *dest, probe_list_t *src);
+
+pmclass Instrument auto_attrs dynpmc provides hash group instrument_group {
+    ATTR Parrot_Interp  supervised;         /* The interpreter running the code */
+    ATTR PMC           *probes;             /* A list of probes registered. */
+    ATTR PMC           *instrument_rc;      /* Reference to the InstrumentRuncore object. */
+    ATTR PMC           *instrument_gc;      /* Reference to the InstrumentGC object. */
+    ATTR Hash          *instrument_classes; /* Registry to hold instances of InstrumentClass. */
+    ATTR Hash          *instrument_objects; /* Registry of current instrumented objects. */
+    ATTR Hash          *event_handlers;     /* Reference to registered instrument event handlers. */
+
+/*
+
+=item C<void init()>
+
+Initializes the pmc and creates a child interpreter.
+
+=cut
+
+*/
+
+    VTABLE void init() {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        INTVAL gc_class_type, rc_class_type;
+
+        /* Obtain the class type of InstrumentGC. */
+        gc_class_type = Parrot_pmc_get_type_str(INTERP, CONST_STRING(INTERP, "InstrumentGC"));
+        rc_class_type = Parrot_pmc_get_type_str(INTERP, CONST_STRING(INTERP, "InstrumentRuncore"));
+
+        /* Initialise the attributes. */
+        attr->supervised         = Parrot_new(INTERP);
+        attr->probes             = Parrot_pmc_new(INTERP, enum_class_Hash);
+        attr->event_handlers     = parrot_new_hash(INTERP);
+        attr->instrument_classes = parrot_new_hash(INTERP);
+        attr->instrument_rc      = Parrot_pmc_new_init(INTERP, rc_class_type, SELF);
+        attr->instrument_gc      = Parrot_pmc_new_init(INTERP, gc_class_type, SELF);
+        attr->instrument_objects = parrot_new_pointer_hash(INTERP);
+
+        /* Initialize the scheduler for the child interpreter */
+        attr->supervised->scheduler = Parrot_pmc_new(interp, enum_class_Scheduler);
+        attr->supervised->scheduler = VTABLE_share_ro(interp, attr->supervised->scheduler);
+
+        /* Set self to destroy manually */
+        PObj_custom_mark_destroy_SETALL(SELF);
+    }
+
+/*
+
+=item C<void destroy()>
+
+Cleans up after the PMC.
+
+=cut
+
+*/
+
+    VTABLE void destroy() {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        Parrot_destroy(attr->supervised);
+        parrot_hash_destroy(INTERP, attr->event_handlers);
+        parrot_hash_destroy(INTERP, attr->instrument_classes);
+        parrot_hash_destroy(INTERP, attr->instrument_objects);
+    }
+
+/*
+
+=item C<void mark()>
+
+Marks internal data structures as live to the gc.
+
+=cut
+
+*/
+
+    VTABLE void mark() {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+
+        /* Mark attributes as alive */
+        Parrot_gc_mark_PMC_alive_fun(INTERP, attr->probes);
+        Parrot_gc_mark_PMC_alive_fun(INTERP, attr->instrument_gc);
+        Parrot_gc_mark_PMC_alive_fun(INTERP, attr->instrument_rc);
+        parrot_mark_hash(INTERP, attr->event_handlers);
+        parrot_mark_hash(INTERP, attr->instrument_classes);
+        parrot_mark_hash(INTERP, attr->instrument_objects);
+    }
+
+/*
+
+=item C<void get_pmc_keyed(PMC *key)>
+
+Get the property with the key.
+
+Keys:
+probes  : returns the clone of the hash of probes currently registered.
+runcore : returns the InstrumentRuncore instance.
+gc      : returns the InstrumentGC instance.
+
+Unknown keys are sent to the supervised interpreter.
+
+=cut
+
+*/
+
+    VTABLE PMC *get_pmc_keyed(PMC *key) {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        PMC *nextkey, *supervised_pmc;
+        STRING *item = key_string(INTERP, key);
+        STRING *name;
+
+        /* probes: return the hash of probes */
+        name = CONST_STRING(INTERP, "probes");
+        if (Parrot_str_equal(INTERP, name, item)) {
+            return VTABLE_clone(INTERP, attr->probes);
+        }
+
+        /* gc: returns the InstrumentGC instance. */
+        name = CONST_STRING(INTERP, "gc");
+        if (Parrot_str_equal(INTERP, name, item)) {
+            return attr->instrument_gc;
+        }
+
+        /* runcore: returns the InstrumentRuncore instance. */
+        name = CONST_STRING(INTERP, "runcore");
+        if (Parrot_str_equal(INTERP, name, item)) {
+            return attr->instrument_rc;
+        }
+
+        /* push to the supervised interpreter. */
+        supervised_pmc = VTABLE_get_pmc_keyed_int(attr->supervised,
+                                                  attr->supervised->iglobals,
+                                                  (INTVAL) IGLOBALS_INTERPRETER);
+        return VTABLE_get_pmc_keyed(INTERP, supervised_pmc, key);
+    }
+
+/*
+
+=item C<void run(STRING file, PMC *args)>
+
+Executes the given file, 'file', in the child interpreter,
+passing the arguments in the form of the array 'args' to the
+program in 'file'.
+
+=cut
+
+*/
+
+    METHOD run(STRING file, PMC *args) {
+        int argc = 0, status;
+        char * default_argv[] = {NULL};
+        char ** argv = default_argv;
+        char * file_c;
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        PMC *probe_iter;
+        int counter = 0;
+
+        /* If args is not null, does array and has a size > 0, convert it
+           into a cstring array to pass to imcc.
+         */
+        if (!Parrot_pmc_is_null(INTERP, args)
+        &&   VTABLE_does(INTERP, args, CONST_STRING(INTERP, "array"))
+        &&   VTABLE_get_integer(INTERP, args) > 0) {
+
+            /* Get the number of argument values */
+            int count = VTABLE_get_integer(INTERP, args);
+
+            /* Allocate enough memory for the argv pointer array */
+            argv = (char **) mem_gc_allocate_n_zeroed_typed(INTERP, count, char *);
+
+            /* Populate the argv array, updating argc in the process */
+            for (argc = 0; argc < count; argc++) {
+                STRING *cur;
+
+                cur = VTABLE_get_string_keyed_int(INTERP, args, argc);
+                argv[argc] = Parrot_str_to_cstring(INTERP, cur);
+            }
+        }
+
+        /* Begin Execution */
+        file_c = Parrot_str_to_cstring(attr->supervised, file);
+        status = imcc_run(attr->supervised,
+                    file_c,
+                    argc, (const char **) argv);
+        if (status) {
+            imcc_run_pbc(attr->supervised,
+                         attr->supervised->output_file,
+                         argc, (const char **) argv);
+        }
+        Parrot_str_free_cstring(file_c);
+
+        /* Finalize the instruments */
+        probe_iter = VTABLE_get_iter(INTERP, attr->probes);
+        while (VTABLE_get_bool(INTERP, probe_iter)) {
+            PMC *key, *probe, *finalize_sub;
+
+            /* For the current probe, get the finalize attribute. */
+            key          = VTABLE_shift_pmc(INTERP, probe_iter);
+            probe        = VTABLE_get_pmc_keyed(INTERP, attr->probes, key);
+            finalize_sub = VTABLE_get_attr_str(INTERP, probe,
+                                               CONST_STRING(INTERP, "$!finalize"));
+
+            /* If it is set, call that sub. */
+            if (!PMC_IS_NULL(finalize_sub)) {
+                Parrot_ext_call(INTERP, finalize_sub, "->");
+            }
+        }
+
+        /* We should free the cstrings allocated above if needed */
+        if (argc > 0) {
+            for (; argc > 0; argc--) {
+                Parrot_str_free_cstring(argv[argc - 1]);
+                argv[argc - 1] = NULL;
+            }
+
+            /* Free the memory allocated to hold the string pointers */
+            mem_gc_free(INTERP, argv);
+            argv = NULL;
+        }
+    }
+
+/*
+
+=item C<void attach(PMC *obj)>
+
+With the passed in object, assume it is a class with the method 'enable'
+and attribute 'instr_obj'. Set the '$!instr_obj' attribute to SELF and call the
+'enable' method of the object for the object to commence attaching the hooks.
+
+=cut
+
+*/
+
+    METHOD attach(PMC *obj) {
+        PMC *id;
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+
+        STRING *instr_attr = CONST_STRING(INTERP, "$!instr_obj");
+        STRING *id_attr    = CONST_STRING(INTERP, "$!identifier");
+        STRING *_on_attach = CONST_STRING(INTERP, "_on_attach");
+
+        VTABLE_set_attr_str(INTERP, obj, instr_attr, SELF);
+        Parrot_pcc_invoke_method_from_c_args(INTERP, obj, _on_attach, "->");
+
+        /* Register the probe. */
+        id = VTABLE_get_attr_str(INTERP, obj, id_attr);
+        VTABLE_set_pmc_keyed(INTERP, attr->probes, id, obj);
+    }
+
+/*
+=item C<PMC* instrument_class(STRING *classname)>
+
+Returns the InstrumentClass instance associated with the given classname.
+Creates a new InstrumentClass instance if there is none currently associated.
+
+=cut
+*/
+
+    METHOD instrument_class(STRING *classname) {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        PMC *obj_instr;
+        INTVAL  class_type, obj_type;
+        PMC    *class_instr, *key;
+
+        /* Create the Instrument::Event::Object instance. */
+        key = key_new_cstring(INTERP, "Instrument");
+        key_append(INTERP, key, key_new_cstring(INTERP, "Event"));
+        key_append(INTERP, key, key_new_cstring(INTERP, "Class"));
+
+        obj_type  = Parrot_pmc_get_type(INTERP, key);
+        obj_instr = Parrot_pmc_new(INTERP, obj_type);
+        Parrot_pcc_invoke_method_from_c_args(INTERP, obj_instr,
+                                             CONST_STRING(INTERP, "new"), "->P", &obj_instr);
+
+        /* Attach to the InstrumentObject instance. */
+        class_instr = (PMC *) parrot_hash_get(INTERP, attr->instrument_classes, classname);
+        if (PMC_IS_NULL(class_instr)) {
+            class_type  = Parrot_pmc_get_type_str(INTERP, CONST_STRING(INTERP, "InstrumentClass"));
+            class_instr = Parrot_pmc_new_init(INTERP, class_type, SELF);
+
+            () = PCCINVOKE(INTERP, class_instr, "attach_to_class", STRING *classname);
+
+            parrot_hash_put(INTERP, attr->instrument_classes, classname, class_instr);
+        }
+        VTABLE_set_attr_str(INTERP, obj_instr, CONST_STRING(INTERP, "$!hook_obj"), class_instr);
+
+        RETURN(PMC *obj_instr);
+    }
+
+/*
+=item C<PMC* instrument_object(PMC *object)>
+
+Returns an Instrument::Event::Object instance that is tied to the given object.
+If none exists in cache, create a new instance and return it.
+
+=cut
+*/
+
+    METHOD instrument_object(PMC *object) {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        PMC *obj_instr;
+        INTVAL  class_type, obj_type;
+        PMC    *class_instr, *key;
+        STRING *new_str, *hook_str;
+
+        new_str  = CONST_STRING(INTERP, "new");
+        hook_str = CONST_STRING(INTERP, "$!hook_obj");
+
+        /* Create the Instrument::Event::Object instance. */
+        key = key_new_cstring(INTERP, "Instrument");
+        key_append(INTERP, key, key_new_cstring(INTERP, "Event"));
+        key_append(INTERP, key, key_new_cstring(INTERP, "Object"));
+
+        obj_type  = Parrot_pmc_get_type(INTERP, key);
+        obj_instr = Parrot_pmc_new(INTERP, obj_type);
+        Parrot_pcc_invoke_method_from_c_args(INTERP, obj_instr, new_str, "->P", &obj_instr);
+
+        /* Attach to the InstrumentObject instance. */
+        class_instr = (PMC *) parrot_hash_get(INTERP, attr->instrument_objects, object);
+        if (PMC_IS_NULL(class_instr)) {
+            PMC *dest_key, *dest_obj;
+            INTVAL dest_type;
+
+            class_type  = Parrot_pmc_get_type_str(INTERP, CONST_STRING(INTERP, "InstrumentObject"));
+            class_instr = Parrot_pmc_new_init(INTERP, class_type, SELF);
+
+            () = PCCINVOKE(INTERP, class_instr, "attach_to_object", PMC *object);
+
+            parrot_hash_put(INTERP, attr->instrument_objects, object, class_instr);
+
+            /* Create an instance of Instrument::Event::ObjectDestroy so that we can
+               be notified when the object is dead. */
+            dest_key = key_new_cstring(INTERP, "Instrument");
+            key_append(INTERP, dest_key, key_new_cstring(INTERP, "Event"));
+            key_append(INTERP, dest_key, key_new_cstring(INTERP, "ObjectDestroy"));
+
+            dest_type = Parrot_pmc_get_type(INTERP, dest_key);
+            dest_obj  = Parrot_pmc_new(INTERP, dest_type);
+            Parrot_pcc_invoke_method_from_c_args(INTERP, dest_obj, new_str, "->P", &dest_obj);
+
+            VTABLE_set_attr_str(INTERP, dest_obj, hook_str, class_instr);
+            VTABLE_set_attr_str(INTERP, dest_obj, CONST_STRING(INTERP, "$!instr_obj"), SELF);
+            Parrot_pcc_invoke_method_from_c_args(INTERP, dest_obj,
+                                                 CONST_STRING(INTERP, "_self_attach"), "->");
+        }
+        VTABLE_set_attr_str(INTERP, obj_instr, hook_str, class_instr);
+
+        RETURN(PMC *obj_instr);
+    }
+
+/*
+=item C<PMC* instrument_op()>
+
+Creates and returns an instance of Instrument::Probe that can be used
+to inspect ops being executed.
+
+=cut
+*/
+
+    METHOD instrument_op() {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        PMC *key, *obj;
+        INTVAL type;
+
+        key = key_new_cstring(INTERP, "Instrument");
+        key_append(INTERP, key, key_new_cstring(INTERP, "Probe"));
+
+        type = Parrot_pmc_get_type(INTERP, key);
+        obj  = Parrot_pmc_new(INTERP, type);
+        (PMC *obj) = PCCINVOKE(INTERP, obj, "new");
+
+        VTABLE_set_attr_str(INTERP, obj, CONST_STRING(INTERP, "$!instr_obj"), SELF);
+        VTABLE_set_attr_str(INTERP, obj, CONST_STRING(INTERP, "$!hook_obj"), attr->instrument_rc);
+
+        RETURN(PMC *obj);
+    }
+
+/*
+=item C<PMC* instrument_gc()>
+
+Creates and returns an instance of Instrument::Event::GC that can be used
+to inspect any calls to gc functions.
+
+=cut
+*/
+
+    METHOD instrument_gc() {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        PMC *key, *obj;
+        INTVAL type;
+
+        key = key_new_cstring(INTERP, "Instrument");
+        key_append(INTERP, key, key_new_cstring(INTERP, "Event"));
+        key_append(INTERP, key, key_new_cstring(INTERP, "GC"));
+
+        type = Parrot_pmc_get_type(INTERP, key);
+        obj  = Parrot_pmc_new(INTERP, type);
+        (PMC *obj) = PCCINVOKE(INTERP, obj, "new");
+
+        VTABLE_set_attr_str(INTERP, obj, CONST_STRING(INTERP, "$!instr_obj"), SELF);
+        VTABLE_set_attr_str(INTERP, obj, CONST_STRING(INTERP, "$!hook_obj"), attr->instrument_gc);
+
+        RETURN(PMC *obj);
+    }
+
+/*
+=item C<void register_eventhandler(STRING *event, PMC *handler)>
+
+Registers the given handler as a handler to the given event.
+Whenever the event is raised, the handler is called as well.
+
+=cut
+*/
+
+    METHOD register_eventhandler(STRING *event, PMC *handler) {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        probe_list_t *list;
+        PMC *ptr;
+
+        ptr  = (PMC *) parrot_hash_get(INTERP, attr->event_handlers, event);
+        list = (!PMC_IS_NULL(ptr)) ? (probe_list_t *) VTABLE_get_pointer(INTERP, ptr):NULL;
+        if (list == NULL) {
+            list = probe_list_create_list(INTERP);
+            ptr  = Parrot_pmc_new(INTERP, enum_class_Pointer);
+            VTABLE_set_pointer(INTERP, ptr, list);
+            parrot_hash_put(INTERP, attr->event_handlers, event, ptr);
+        }
+
+        probe_list_push(INTERP, list, handler);
+    }
+
+/*
+=item C<void remove_eventhandler(STRING *event, PMC *handler)>
+
+Deregisters the given handler from the given event, preventing the
+handler from being called when the event is raised.
+
+=cut
+*/
+
+    METHOD remove_eventhandler(STRING *event, PMC *handler) {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        probe_list_t *list;
+        PMC *ptr;
+
+        ptr  = (PMC *) parrot_hash_get(INTERP, attr->event_handlers, event);
+        list = (!PMC_IS_NULL(ptr)) ? (probe_list_t *) VTABLE_get_pointer(INTERP, ptr):NULL;
+        if (list != NULL) {
+            probe_node_t *entry;
+            entry = probe_list_find(INTERP, list, handler);
+            probe_list_remove(INTERP, list, entry);
+        }
+    }
+
+/*
+=item C<PMC* raise_event(STRING *event, PMC *data,
+PMC *recall :optional, INTVAL has_recall :opt_flag)>
+
+Raises the given event, passing data, SELF and the handler to the
+callbacks. If given an array of callbacks (recall), will call the
+callbacks in the array instead of regenerating a list of callbacks.
+
+Returns a Pointer pmc instance if any of the callbacks returns an
+invokable, which can then be passed back to raise_event to be recalled.
+
+=cut
+*/
+
+    METHOD raise_event(STRING *event, PMC *data,
+                       PMC *recall :optional, INTVAL has_recall :opt_flag) {
+        Parrot_Instrument_attributes * const attr = PARROT_INSTRUMENT(SELF);
+        probe_list_t *ret_list, *cur_list;
+        PMC *ret;
+
+        /* Build up the handlers to call. */
+        if (!has_recall || PMC_IS_NULL(recall)) {
+            Parrot_Context_info info;
+            PMC *event_tokens, *cur_event, *iter;
+
+            STRING *const_colons = CONST_STRING(INTERP, "::");
+            STRING *const_event  = CONST_STRING(INTERP, "event");
+            STRING *const_file   = CONST_STRING(INTERP, "file");
+            STRING *const_sub    = CONST_STRING(INTERP, "sub");
+            STRING *const_line   = CONST_STRING(INTERP, "line");
+            STRING *const_ns     = CONST_STRING(INTERP, "namespace");
+
+            event_tokens = Parrot_str_split(INTERP, const_colons, event);
+            cur_event    = Parrot_pmc_new(INTERP, enum_class_ResizableStringArray);
+            cur_list     = probe_list_create_list(INTERP);
+
+            iter = VTABLE_get_iter(INTERP, event_tokens);
+            while (VTABLE_get_bool(INTERP, iter)) {
+                STRING *key;
+                probe_list_t *to_add;
+                PMC *ptr;
+
+                VTABLE_push_pmc(INTERP, cur_event, VTABLE_shift_pmc(INTERP, iter));
+                key = Parrot_str_join(INTERP, const_colons, cur_event);
+
+                ptr    = (PMC *) parrot_hash_get(INTERP, attr->event_handlers, key);
+                to_add = (!PMC_IS_NULL(ptr)) ? (probe_list_t *)VTABLE_get_pointer(INTERP, ptr):NULL;
+                probe_list_append(INTERP, cur_list, to_add);
+            }
+
+            /* Add common items to data. */
+            Parrot_Context_get_info(INTERP, CURRENT_CONTEXT(attr->supervised), &info);
+            VTABLE_set_pmc_keyed_str(INTERP, data, const_event, event_tokens);
+            VTABLE_set_string_keyed_str(INTERP, data, const_file, info.file);
+            VTABLE_set_string_keyed_str(INTERP, data, const_sub, info.subname);
+            VTABLE_set_string_keyed_str(INTERP, data, const_line, info.nsname);
+            VTABLE_set_integer_keyed_str(INTERP, data, const_line, info.line);
+        }
+        else {
+            cur_list = (probe_list_t *) VTABLE_get_pointer(INTERP, recall);
+        }
+
+        /* Execute the handlers. */
+        ret_list = fire_callbacks(INTERP, cur_list, data, SELF);
+        ret      = Parrot_pmc_new(INTERP, enum_class_Pointer);
+        VTABLE_set_pointer(INTERP, ret, ret_list);
+
+        RETURN(PMC *ret);
+    }
+
+/*
+=item C<void refresh_probes()>
+
+For all probes currently registered, refreshes all of them.
+All probes that are enabled when this is called will be disabled
+and then re-enabled, allowing them to re-register their events
+and hooks. This is very useful when loading dynlibs and such.
+
+=cut
+*/
+
+    METHOD refresh_probes() {
+        PMC *iter, *probes;
+        STRING *refresh;
+
+        refresh = CONST_STRING(INTERP, "refresh");
+
+        GETATTR_Instrument_probes(INTERP, SELF, probes);
+        iter = VTABLE_get_iter(INTERP, probes);
+
+        while (VTABLE_get_bool(INTERP, iter)) {
+            PMC *key, *obj, *enabled;
+            key = VTABLE_shift_pmc(INTERP, iter);
+            obj = VTABLE_get_pmc_keyed(INTERP, probes, key);
+
+            Parrot_pcc_invoke_method_from_c_args(INTERP, obj, refresh, "->");
+        }
+    }
+
+}
+
+/*
+
+=item C<probe_list_t * fire_callbacks(PARROT_INTERP,
+probe_list_t *callbacks, PMC *data, PMC *instr)>
+
+Calls the callbacks given in the list of callbacks, passing data, instr
+and the probe instance itself to the callback.
+
+Returns a list of callbacks that were returned by the invokables.
+
+For internal use only.
+
+=cut
+
+*/
+
+probe_list_t *
+fire_callbacks(PARROT_INTERP, probe_list_t *callbacks, PMC *data, PMC *instr) {
+    probe_node_t *cur;
+    probe_list_t *ret_list;
+
+    STRING *array         = CONST_STRING(interp, "array");
+    STRING *callback_attr = CONST_STRING(interp, "$!callback");
+    STRING *invokable     = CONST_STRING(interp, "invokable");
+
+    ret_list = probe_list_create_list(interp);
+
+    /* Execute the probes in the list. */
+    for (cur = callbacks->head; cur != NULL; cur = cur->next) {
+        PMC *callback;
+        PMC *handler;
+
+        /* Get the handler and list object. */
+        if (VTABLE_does(interp, cur->list_obj, array)) {
+            /* Obtain the probe and callback from the RPA. */
+            handler  = VTABLE_get_pmc_keyed_int(interp, cur->list_obj, 0);
+            callback = VTABLE_get_pmc_keyed_int(interp, cur->list_obj, 1);
+        }
+        else {
+            /* Node contains the probe object. Obtain the callback from its attributes. */
+            handler  = cur->list_obj;
+            callback = VTABLE_get_attr_str(interp, handler, callback_attr);
+        }
+
+        if (!PMC_IS_NULL(callback)) {
+            /* Pass params: InstrumentOp, Instrument, Instrument::Probe.
+               If a PMC is returned, only push it into the recall list if
+               it is invokable. */
+            PMC *recall = PMCNULL;
+            Parrot_ext_call(interp, callback, "PPP->P", data, instr, handler, &recall);
+
+            if (!PMC_IS_NULL(recall) && VTABLE_does(interp, recall, invokable)) {
+                PMC *list_entry;
+
+                list_entry = Parrot_pmc_new(interp, enum_class_ResizablePMCArray);
+                VTABLE_push_pmc(interp, list_entry, handler);
+                VTABLE_push_pmc(interp, list_entry, recall);
+
+                probe_list_push(interp, ret_list, list_entry);
+            }
+        }
+    }
+
+    /* Cleanup list and return. */
+    probe_list_delete_list(interp, callbacks);
+    return ret_list;
+}
+
+/*
+
+=item C<PMC *instrument_pack_params(PARROT_INTERP, const char *format, ...)>
+
+Packs the given variable list of arguments according to the given
+format into a ResizablePMCArray.
+
+For internal use only.
+
+=cut
+
+*/
+
+PMC *instrument_pack_params(PARROT_INTERP, const char *format, ...) {
+    PMC *ret;
+    va_list args;
+    char const * cur;
+
+    va_start(args, format);
+    ret = Parrot_pmc_new(interp, enum_class_ResizablePMCArray);
+
+    for (cur = format; *cur != '\0'; cur++) {
+        /* P : PMC
+           I : integer
+           F : floatval
+           S : string
+           V : pointer */
+        switch (*cur) {
+          case 'P':
+            VTABLE_push_pmc(interp, ret, (PMC *) va_arg(args, PMC *));
+            break;
+          case 'I':
+            VTABLE_push_integer(interp, ret, (INTVAL) va_arg(args, INTVAL));
+            break;
+          case 'F':
+            VTABLE_push_float(interp, ret, (FLOATVAL) va_arg(args, FLOATVAL));
+            break;
+          case 'S':
+            VTABLE_push_string(interp, ret, (STRING *) va_arg(args, STRING *));
+            break;
+          case 'V':
+            {
+                PMC *ptr;
+                ptr = Parrot_pmc_new(interp, enum_class_Pointer);
+                VTABLE_set_pointer(interp, ptr, (void *) va_arg(args, void *));
+                VTABLE_push_pmc(interp, ret, ptr);
+            }
+            break;
+          default:
+            /* Unknown. */
+            Parrot_ex_throw_from_c_args(interp, NULL, 1,
+                "Unknown format in instrument_pack_params: %c\n", cur);
+        }
+    }
+
+    return ret;
+}
+
+/*
+ * Functions implementing the linked list for the probes.
+ */
+
+/*
+ * Creates a new list.
+ */
+probe_list_t *probe_list_create_list(PARROT_INTERP) {
+    probe_list_t *list;
+
+    list = mem_gc_allocate_zeroed_typed(interp, probe_list_t);
+
+    list->head  = NULL;
+    list->tail  = NULL;
+    list->count = 0;
+
+    return list;
+}
+
+/*
+ * Creates a new list node.
+ */
+probe_node_t *probe_list_create_node(PARROT_INTERP) {
+    probe_node_t *node;
+
+    node = mem_gc_allocate_zeroed_typed(interp, probe_node_t);
+
+    node->next     = NULL;
+    node->prev     = NULL;
+    node->list_obj = NULL;
+
+    return node;
+}
+
+/*
+ * Deletes the list.
+ */
+void probe_list_delete_list(PARROT_INTERP, probe_list_t *list) {
+    probe_node_t *node, *next;
+    if (list == NULL) { return; }
+
+    node = list->head;
+    while (node != NULL) {
+        next = node->next;
+        probe_list_delete_node(interp, node);
+        node = next;
+    }
+
+    mem_gc_free(interp, list);
+}
+
+/*
+ * Deletes the node.
+ */
+void probe_list_delete_node(PARROT_INTERP, probe_node_t *node) {
+    if (node == NULL) { return; }
+    mem_gc_free(interp, node);
+}
+
+/*
+ * Pushes item to the end of the list.
+ */
+void probe_list_push(PARROT_INTERP, probe_list_t *list, PMC *item) {
+    probe_node_t *node = probe_list_create_node(interp);
+    node->list_obj     = item;
+
+    if (list->head == NULL) {
+        list->head = list->tail = node;
+    }
+    else {
+        node->prev       = list->tail;
+        node->next       = NULL;
+        list->tail->next = node;
+        list->tail       = node;
+    }
+
+    list->count++;
+}
+
+/*
+ * Removes item at the end of the list.
+ */
+PMC * probe_list_pop(PARROT_INTERP, probe_list_t *list) {
+    PMC *item = PMCNULL;
+    probe_node_t *node = list->tail;
+
+    if (node != NULL) {
+        if (node == list->head) {
+            list->head = list->tail = NULL;
+        }
+        else {
+            list->tail       = node->prev;
+            list->tail->next = NULL;
+        }
+
+        item = node->list_obj;
+
+        probe_list_delete_node(interp, node);
+    }
+
+    list->count--;
+    return item;
+}
+
+/*
+ * Removes the given node. Used with probe_list_find.
+ * Returns the item in that node.
+ */
+PMC * probe_list_remove(PARROT_INTERP, probe_list_t *list, probe_node_t *node) {
+    PMC *item;
+    if (node == NULL) { return PMCNULL; }
+
+    if (node == list->head) { list->head = node->next; }
+    if (node == list->tail) { list->tail = node->prev; }
+
+    if (node->prev != NULL) { node->prev->next = node->next; }
+    if (node->next != NULL) { node->next->prev = node->prev; }
+
+    item = node->list_obj;
+
+    probe_list_delete_node(interp, node);
+
+    list->count--;
+    return item;
+}
+
+/*
+ * Locates item within the list and returns the node.
+ */
+probe_node_t *probe_list_find(PARROT_INTERP, probe_list_t *list, PMC *val) {
+    probe_node_t *cur_node = list->head;
+
+    while (cur_node != NULL) {
+        if (cur_node->list_obj == val) { return cur_node; }
+
+        cur_node = cur_node->next;
+    }
+
+    return NULL;
+}
+
+/*
+ * Appends list src to the end of list dest.
+ * Nodes are duplicated.
+ */
+void probe_list_append(PARROT_INTERP, probe_list_t *dest, probe_list_t *src) {
+    probe_node_t *cur, *dup;
+    if (src == NULL || dest == NULL) { return; }
+
+    for (cur = src->head; cur != NULL; cur = cur->next) {
+        probe_list_push(interp, dest, cur->list_obj);
+        dest->count++;
+    }
+}
+
+/*
+=back
+
+=head1 SEE ALS0
+
+=cut
+*/
+
+/*
+ * Local variables:
+ *   c-file-style: "parrot"
+ * End:
+ * vim: expandtab shiftwidth=4:
+ */

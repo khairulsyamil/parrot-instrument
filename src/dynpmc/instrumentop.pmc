@@ -1,0 +1,392 @@
+/*
+Copyright (C) 2010, Parrot Foundation.
+$Id: instrumentop.pmc 48346 2010-08-08 16:34:32Z khairul $
+
+=head1 NAME
+
+src/dynpmc/instrumentop.pmc - Interface to current executing opcode info.
+
+=head1 DESCRIPTION
+
+C<InstrumentOp> is a PMC class that provides an interface to obtain
+information about the current executing op.
+
+=head2 Methods
+
+=over 4
+
+=cut
+
+*/
+
+#include "parrot/parrot.h"
+#include "parrot/opsenum.h"
+
+#include "pmc_instrument.h"
+
+pmclass InstrumentOp auto_attrs dynpmc group instrument_group {
+    ATTR Parrot_Interp  interp; /* Interpreter to get op values from. */
+    ATTR opcode_t      *pc;     /* Current progam counter of interp above. */
+
+/*
+
+=item C<void init()>
+
+Initializes the pmc, setting the interp and pc to NULL.
+
+=cut
+
+*/
+
+    VTABLE void init() {
+        SETATTR_InstrumentOp_interp(INTERP, SELF, NULL);
+        SETATTR_InstrumentOp_pc(INTERP, SELF, NULL);
+    }
+
+/*
+
+=item C<void init_pmc(PMC *interp_pmc)>
+
+Initializes the pmc, setting the interp to the given value and pc to NULL.
+
+=cut
+
+*/
+
+    VTABLE void init_pmc(PMC *instrument) {
+        Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
+
+        GETATTR_Instrument_supervised(INTERP, instrument, attr->interp);
+        attr->pc     = NULL;
+    }
+
+/*
+
+=item C<void set_pointer(void *vptr_pc)>
+
+Sets the current pc to the given pointer.
+
+=cut
+
+*/
+
+    VTABLE void set_pointer(void *vptr_pc) {
+        SETATTR_InstrumentOp_pc(INTERP, SELF, (opcode_t *) vptr_pc);
+    }
+
+/*
+
+=item C<void * get_pointer()>
+
+Returns the current pc pointer.
+
+=cut
+
+*/
+
+    VTABLE void * get_pointer() {
+        opcode_t *pc;
+        GETATTR_InstrumentOp_pc(INTERP, SELF, pc);
+
+        return (void *) pc;
+    }
+
+/*
+
+=item C<STRING* name()>
+
+Returns the full name of the current op.
+
+=cut
+
+*/
+
+    METHOD name() {
+        Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
+        UINTVAL op = *(attr->pc);
+
+        STRING *name = CONST_STRING(INTERP, attr->interp->op_info_table[op].full_name);
+
+        RETURN(STRING *name);
+    }
+
+/*
+
+=item C<STRING* family()>
+
+Returns the name of the current op family (short name).
+
+=cut
+
+*/
+
+    METHOD family() {
+        Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
+        UINTVAL op = *(attr->pc);
+
+        STRING *name = CONST_STRING(INTERP, attr->interp->op_info_table[op].name);
+
+        RETURN(STRING *name);
+    }
+
+/*
+
+=item C<INTVAL count()>
+
+Returns the number of arguments of the current op.
+For special ops like set_args_pc, add the variable argument count to the total count.
+
+=cut
+
+*/
+
+    METHOD count() {
+        Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
+        UINTVAL op = *(attr->pc);
+        INTVAL count = attr->interp->op_info_table[op].op_count - 1;
+
+        if (op == enum_ops_set_args_pc
+         || op == enum_ops_get_results_pc
+         || op == enum_ops_get_params_pc
+         || op == enum_ops_set_returns_pc) {
+            PMC * const sig = attr->interp->code->const_table->constants[(attr->pc)[1]]->u.key;
+            count += VTABLE_elements(attr->interp, sig);
+        }
+
+        RETURN(INTVAL count);
+    }
+
+/*
+
+=item C<INTVAL arg_type(INTVAL arg_index)>
+
+Returns the argument type at the given index.
+Takes into account the special ops with variable arguments.
+
+=cut
+
+*/
+
+    METHOD arg_type(INTVAL arg_index) {
+        Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
+        UINTVAL op = *(attr->pc);
+        INTVAL type;
+
+        if ((op == enum_ops_set_args_pc
+           || op == enum_ops_get_results_pc
+           || op == enum_ops_get_params_pc
+           || op == enum_ops_set_returns_pc)
+         && arg_index >= 1) {
+            PMC * const sig = attr->interp->code->const_table->constants[(attr->pc)[1]]->u.key;
+            type = VTABLE_get_integer_keyed_int(attr->interp, sig, arg_index - 1) &
+                    (PARROT_ARG_TYPE_MASK|PARROT_ARG_CONSTANT);
+        }
+        else {
+            type = attr->interp->op_info_table[op].types[arg_index];
+        }
+
+        RETURN(INTVAL type);
+    }
+
+/*
+
+=item C<INTVAL pc()>
+
+Returns the current relative pc value.
+
+=cut
+
+*/
+
+    METHOD pc() {
+        Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
+        INTVAL pc_rel = attr->pc - attr->interp->code->base.data;
+
+        RETURN(INTVAL pc_rel);
+    }
+
+/*
+
+=item C<STRING pc_address()>
+
+Returns the pc address as a string.
+
+=cut
+
+*/
+
+    METHOD pc_address() {
+        Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
+        STRING* pc_rel = Parrot_sprintf_c(INTERP, "%p", attr->pc);
+
+        RETURN(STRING* pc_rel);
+    }
+
+/*
+
+=item C<PMC* get_arg(INTVAL arg_index, INTVAL raw :optional)>
+
+Returns the argument as interpreted according to its type at the given index.
+If raw is defined and is not 0, returns the raw INTVAL value at that index.
+Takes into account the special ops with variable arguments.
+
+=cut
+
+*/
+
+    METHOD get_arg(INTVAL arg_index, INTVAL raw :optional, INTVAL has_raw :opt_flag) {
+        Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
+        PMC *ret, *cc, *key;
+        arg_type_t type;
+        INTVAL arg = (attr->pc)[arg_index + 1];
+        INTVAL op  = *(attr->pc);
+
+
+         if (has_raw && raw != 0) {
+            /* Raw is always an integer. */
+            ret = Parrot_pmc_new(INTERP, enum_class_Integer);
+            VTABLE_set_integer_native(INTERP, ret, arg);
+
+            RETURN(PMC *ret);
+         }
+
+        cc = CURRENT_CONTEXT(attr->interp);
+
+        if ((op == enum_ops_set_args_pc
+           || op == enum_ops_get_results_pc
+           || op == enum_ops_get_params_pc
+           || op == enum_ops_set_returns_pc)
+         && arg_index >= 1) {
+            PMC * const sig = attr->interp->code->const_table->constants[(attr->pc)[1]]->u.key;
+            type = VTABLE_get_integer_keyed_int(attr->interp, sig, arg_index - 1) &
+                    (PARROT_ARG_TYPE_MASK|PARROT_ARG_CONSTANT);
+        }
+        else {
+            type = attr->interp->op_info_table[(*attr->pc)].types[arg_index];
+        }
+
+        switch (type) {
+          case PARROT_ARG_IC:
+            /* Integer constants are stored as part of the opcode
+               in the packfile */
+            ret = Parrot_pmc_new(INTERP, enum_class_Integer);
+            VTABLE_set_integer_native(INTERP, ret, arg);
+
+            break;
+          case PARROT_ARG_I:
+            ret = Parrot_pmc_new(INTERP, enum_class_Integer);
+            VTABLE_set_integer_native(INTERP, ret,
+                                      *Parrot_pcc_get_INTVAL_reg(attr->interp, cc, arg));
+
+            break;
+          case PARROT_ARG_NC:
+            ret = Parrot_pmc_new(INTERP, enum_class_Float);
+            VTABLE_set_number_native(INTERP, ret,
+                                     Parrot_pcc_get_num_constant_func(attr->interp, cc, arg));
+
+            break;
+          case PARROT_ARG_N:
+            ret = Parrot_pmc_new(INTERP, enum_class_Float);
+            VTABLE_set_number_native(INTERP, ret,
+                                     *Parrot_pcc_get_FLOATVAL_reg(attr->interp, cc, arg));
+
+            break;
+          case PARROT_ARG_PC:
+            ret = Parrot_pcc_get_pmc_constant_func(attr->interp, cc, arg);
+
+            break;
+          case PARROT_ARG_P:
+            ret = *Parrot_pcc_get_PMC_reg(attr->interp, cc, arg);
+
+            break;
+          case PARROT_ARG_SC:
+            ret = Parrot_pmc_new(INTERP, enum_class_String);
+            VTABLE_set_string_native(INTERP, ret,
+                                     Parrot_pcc_get_string_constant_func(attr->interp,
+                                                                         cc, arg));
+
+            break;
+          case PARROT_ARG_S:
+            ret = Parrot_pmc_new(INTERP, enum_class_String);
+            VTABLE_set_string_native(INTERP, ret,
+                                     *Parrot_pcc_get_STRING_reg(attr->interp, cc, arg));
+
+            break;
+          case PARROT_ARG_K:
+            /* Key is PMC */
+            ret = *Parrot_pcc_get_PMC_reg(attr->interp, cc, arg);
+
+            break;
+          case PARROT_ARG_KC:
+            /* Key is String reg or String const */
+            ret = Parrot_pmc_new(INTERP, enum_class_String);
+            {
+                PMC *key;
+                key = (Parrot_pcc_get_constants(attr->interp, cc)[arg])->u.key;
+
+                VTABLE_set_string_native(INTERP, ret, VTABLE_get_string(attr->interp, key));
+            }
+
+            break;
+          case PARROT_ARG_KI:
+            /* Key is integer reg */
+            ret = Parrot_pmc_new(INTERP, enum_class_Integer);
+            VTABLE_set_integer_native(INTERP, ret,
+                                      *Parrot_pcc_get_INTVAL_reg(attr->interp, cc, arg));
+
+            break;
+          case PARROT_ARG_KIC:
+            /* Key is integer constant */
+            ret = Parrot_pmc_new(INTERP, enum_class_Integer);
+            VTABLE_set_integer_native(INTERP, ret, arg);
+
+            break;
+          default:
+            Parrot_ex_throw_from_c_args(INTERP, NULL, 1,
+                                        "Currently unhandled op arg type %d.", type);
+        };
+
+        RETURN(PMC *ret);
+    }
+
+/*
+
+=item C<PMC* get_context_info()>
+
+Returns the following information in a Hash PMC gathered from the current context:
+1. sub
+2. namespace
+3. file
+4. line
+
+=cut
+
+*/
+
+    METHOD get_context_info() {
+        Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
+        Parrot_Context_info info;
+        PMC *ctx_hash;
+
+        INTVAL ret = Parrot_Context_get_info(attr->interp, CURRENT_CONTEXT(attr->interp), &info);
+        ctx_hash   = Parrot_pmc_new(INTERP, enum_class_Hash);
+
+        VTABLE_set_string_keyed_str(INTERP, ctx_hash,
+                                    CONST_STRING(INTERP, "sub"), info.subname);
+        VTABLE_set_string_keyed_str(INTERP, ctx_hash,
+                                    CONST_STRING(INTERP, "namespace"), info.nsname);
+        VTABLE_set_string_keyed_str(INTERP, ctx_hash,
+                                    CONST_STRING(INTERP, "file"), info.file);
+        VTABLE_set_integer_keyed_str(INTERP, ctx_hash,
+                                    CONST_STRING(INTERP, "line"), info.line);
+
+        RETURN(PMC *ctx_hash);
+    }
+}
+
+/*
+ * Local variables:
+ *   c-file-style: "parrot"
+ * End:
+ * vim: expandtab shiftwidth=4:
+ */
