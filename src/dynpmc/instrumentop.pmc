@@ -21,12 +21,14 @@ information about the current executing op.
 
 #include "parrot/parrot.h"
 #include "parrot/opsenum.h"
+#include "parrot/context.h"
 
 #include "pmc_instrument.h"
 
 pmclass InstrumentOp auto_attrs dynpmc group instrument_group {
-    ATTR Parrot_Interp  interp; /* Interpreter to get op values from. */
-    ATTR opcode_t      *pc;     /* Current progam counter of interp above. */
+    ATTR Parrot_Interp  interp;     /* Interpreter to get op values from. */
+    ATTR opcode_t      *pc;         /* Current progam counter of interp above. */
+    ATTR INTVAL        *op_mapping; /* Set by InstrumentRuncore whenever entering a new runloop. */
 
 /*
 
@@ -57,7 +59,8 @@ Initializes the pmc, setting the interp to the given value and pc to NULL.
         Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
 
         GETATTR_Instrument_supervised(INTERP, instrument, attr->interp);
-        attr->pc     = NULL;
+        attr->pc         = NULL;
+        attr->op_mapping = NULL;
     }
 
 /*
@@ -103,7 +106,7 @@ Returns the full name of the current op.
 
     METHOD name() {
         Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
-        UINTVAL op = *(attr->pc);
+        UINTVAL op = attr->op_mapping[*(attr->pc)];
 
         STRING *name = CONST_STRING(INTERP, attr->interp->op_info_table[op].full_name);
 
@@ -122,7 +125,7 @@ Returns the name of the current op family (short name).
 
     METHOD family() {
         Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
-        UINTVAL op = *(attr->pc);
+        UINTVAL op = attr->op_mapping[*(attr->pc)];
 
         STRING *name = CONST_STRING(INTERP, attr->interp->op_info_table[op].name);
 
@@ -142,14 +145,14 @@ For special ops like set_args_pc, add the variable argument count to the total c
 
     METHOD count() {
         Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
-        UINTVAL op = *(attr->pc);
+        UINTVAL op = attr->op_mapping[*(attr->pc)];
         INTVAL count = attr->interp->op_info_table[op].op_count - 1;
 
         if (op == enum_ops_set_args_pc
          || op == enum_ops_get_results_pc
          || op == enum_ops_get_params_pc
          || op == enum_ops_set_returns_pc) {
-            PMC * const sig = attr->interp->code->const_table->constants[(attr->pc)[1]]->u.key;
+            PMC * const sig = attr->interp->code->const_table->constants[(attr->pc)[1]].u.key;
             count += VTABLE_elements(attr->interp, sig);
         }
 
@@ -169,7 +172,7 @@ Takes into account the special ops with variable arguments.
 
     METHOD arg_type(INTVAL arg_index) {
         Parrot_InstrumentOp_attributes * const attr = PARROT_INSTRUMENTOP(SELF);
-        UINTVAL op = *(attr->pc);
+        UINTVAL op = attr->op_mapping[*(attr->pc)];
         INTVAL type;
 
         if ((op == enum_ops_set_args_pc
@@ -177,7 +180,7 @@ Takes into account the special ops with variable arguments.
            || op == enum_ops_get_params_pc
            || op == enum_ops_set_returns_pc)
          && arg_index >= 1) {
-            PMC * const sig = attr->interp->code->const_table->constants[(attr->pc)[1]]->u.key;
+            PMC * const sig = attr->interp->code->const_table->constants[(attr->pc)[1]].u.key;
             type = VTABLE_get_integer_keyed_int(attr->interp, sig, arg_index - 1) &
                     (PARROT_ARG_TYPE_MASK|PARROT_ARG_CONSTANT);
         }
@@ -239,7 +242,7 @@ Takes into account the special ops with variable arguments.
         PMC *ret, *cc, *key;
         arg_type_t type;
         INTVAL arg = (attr->pc)[arg_index + 1];
-        INTVAL op  = *(attr->pc);
+        UINTVAL op = attr->op_mapping[*(attr->pc)];
 
 
          if (has_raw && raw != 0) {
@@ -257,12 +260,12 @@ Takes into account the special ops with variable arguments.
            || op == enum_ops_get_params_pc
            || op == enum_ops_set_returns_pc)
          && arg_index >= 1) {
-            PMC * const sig = attr->interp->code->const_table->constants[(attr->pc)[1]]->u.key;
+            PMC * const sig = attr->interp->code->const_table->constants[(attr->pc)[1]].u.key;
             type = VTABLE_get_integer_keyed_int(attr->interp, sig, arg_index - 1) &
                     (PARROT_ARG_TYPE_MASK|PARROT_ARG_CONSTANT);
         }
         else {
-            type = attr->interp->op_info_table[(*attr->pc)].types[arg_index];
+            type = attr->interp->op_info_table[op].types[arg_index];
         }
 
         switch (type) {
@@ -301,9 +304,14 @@ Takes into account the special ops with variable arguments.
             break;
           case PARROT_ARG_SC:
             ret = Parrot_pmc_new(INTERP, enum_class_String);
+            {
+                const Parrot_Context * const c = CONTEXT_STRUCT(cc);
+                Parrot_io_printf(INTERP, "Arg: %d %d %d, %c\n", arg_index, arg, c->constants[arg].type, c->constants[arg].type);
+                Parrot_io_printf(INTERP, "Op: %s %d %d %d\n", attr->interp->op_info_table[op].full_name, op, (attr->pc)[1], (attr->pc)[2]);
+            }
             VTABLE_set_string_native(INTERP, ret,
-                                     Parrot_pcc_get_string_constant_func(attr->interp,
-                                                                         cc, arg));
+                                     //(Parrot_pcc_get_constants(attr->interp, cc)[arg]).u.string);
+                                     Parrot_pcc_get_string_constant_func(attr->interp, cc, arg));
 
             break;
           case PARROT_ARG_S:
@@ -322,7 +330,7 @@ Takes into account the special ops with variable arguments.
             ret = Parrot_pmc_new(INTERP, enum_class_String);
             {
                 PMC *key;
-                key = (Parrot_pcc_get_constants(attr->interp, cc)[arg])->u.key;
+                key = (Parrot_pcc_get_constants(attr->interp, cc)[arg]).u.key;
 
                 VTABLE_set_string_native(INTERP, ret, VTABLE_get_string(attr->interp, key));
             }

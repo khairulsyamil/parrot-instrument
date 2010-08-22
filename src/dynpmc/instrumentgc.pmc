@@ -22,7 +22,7 @@ instrument the gc_sys entry of Parrot_Interp.
 #include "parrot/parrot.h"
 
 #include "pmc_instrument.h"
-#include "../gc/gc_private.h"
+#include "gc_private.h"
 
 #include "instrument_private.h"
 #include "instrument_extern.h"

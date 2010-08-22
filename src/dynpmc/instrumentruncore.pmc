@@ -26,6 +26,7 @@ hooks into the execution of the ops.
 #include "pmc/pmc_class.h"
 
 #include "pmc_instrument.h"
+#include "pmc_instrumentop.h"
 
 #include "instrument_private.h"
 #include "instrument_extern.h"
@@ -54,23 +55,23 @@ typedef struct instrument_runcore_t {
 void          runcore_probes_setup(PARROT_INTERP, PMC *runcore);
 void          runcore_probes_refresh_tables(PARROT_INTERP, PMC *runcore);
 probe_list_t* runcore_probes_get_probes(PARROT_INTERP, PMC *runcore, INTVAL op_num);
-probe_list_t* runcore_probes_fire_probes(PARROT_INTERP, PMC *runcore,
+probe_list_t* runcore_probes_fire_probes(PARROT_INTERP, PMC *runcore, PMC *op,
                                          opcode_t *pc, probe_list_t *callbacks);
 
 /* Runcore helpers. */
 void          runcore_runcore_setup(PARROT_INTERP, PMC *runcore);
 opcode_t*     runcore_runcore_runops(PARROT_INTERP, Parrot_runcore_t *core_ptr, opcode_t *pc);
+INTVAL *      runcore_get_op_mappings(Parrot_Interp supervisor, Parrot_Interp interp);
 
 /* Misc helpers */
 void   runcore_library_update(PARROT_INTERP, PMC *runcore);
 void   runcore_vtable_fixup(PARROT_INTERP, PMC *runcore);
 void   runcore_optable_fixup(PARROT_INTERP, PMC *runcore);
-INTVAL runcore_does_loading(opcode_t *pc);
+INTVAL runcore_does_loading(INTVAL op);
 
 pmclass InstrumentRuncore auto_attrs dynpmc group instrument_group {
     ATTR PMC                  *instrument;
     ATTR PMC                  *dynlibs;
-    ATTR PMC                  *op;
     ATTR struct probe_list_t **op_hooks;
     ATTR INTVAL                op_hooks_size;
     ATTR struct probe_list_t  *op_catchall;
@@ -99,11 +100,9 @@ for running under supervision.
 
     VTABLE void init_pmc(PMC *instrument) {
         Parrot_InstrumentRuncore_attributes * const attr = PARROT_INSTRUMENTRUNCORE(SELF);
-        INTVAL op_type = Parrot_pmc_get_type_str(INTERP, CONST_STRING(INTERP, "InstrumentOp"));
 
         attr->instrument    = instrument;
         attr->dynlibs       = Parrot_pmc_new(INTERP, enum_class_Hash);
-        attr->op            = Parrot_pmc_new_init(INTERP, op_type, attr->instrument);
         attr->op_hooks      = NULL;
         attr->op_hooks_size = 0;
         attr->op_catchall   = NULL;
@@ -133,7 +132,6 @@ Marks internal data structures as live to the gc.
     VTABLE void mark() {
         Parrot_InstrumentRuncore_attributes * const attr = PARROT_INSTRUMENTRUNCORE(SELF);
         Parrot_gc_mark_PMC_alive_fun(INTERP, attr->dynlibs);
-        Parrot_gc_mark_PMC_alive_fun(INTERP, attr->op);
     }
 
 /*
@@ -204,6 +202,7 @@ Removes a hook for the given op number.
             Parrot_ex_throw_from_c_args(INTERP, NULL, 1, "Invalid op number %d.", op_num);
         }
 
+        node = NULL;
         if (attr->op_hooks[op_num] != NULL) {
             node = probe_list_find(INTERP, attr->op_hooks[op_num], probe);
             probe_list_remove(INTERP, attr->op_hooks[op_num], node);
@@ -403,11 +402,11 @@ For internal use only.
 */
 
 probe_list_t*
-runcore_probes_fire_probes(PARROT_INTERP, PMC *runcore, opcode_t *pc, probe_list_t *callbacks) {
-    PMC   *op, *instrument, *interp_pmc;
+runcore_probes_fire_probes(PARROT_INTERP, PMC *runcore, PMC *op,
+                           opcode_t *pc, probe_list_t *callbacks) {
+    PMC *instrument;
 
     GETATTR_InstrumentRuncore_instrument(interp, runcore, instrument);
-    GETATTR_InstrumentRuncore_op(interp, runcore, op);
     VTABLE_set_pointer(interp, op, pc);
 
     return fire_callbacks(interp, callbacks, op, instrument);
@@ -468,14 +467,24 @@ For internal use only.
 opcode_t* runcore_runcore_runops(PARROT_INTERP, Parrot_runcore_t *core_ptr, opcode_t *pc) {
     instrument_runcore_t *core;
     Parrot_Interp         supervisor;
-    PMC                  *runcore;
+    PMC                  *runcore, *op, *instrument;
     Parrot_runloop        exc_handler;
+    INTVAL               *op_mapping, op_type;
 
     core       = (instrument_runcore_t *) core_ptr;
     runcore    = core->instrument_rc;
     supervisor = core->supervisor_interp;
 
+    GETATTR_InstrumentRuncore_instrument(supervisor, runcore, instrument);
+    op_type    = Parrot_pmc_get_type_str(supervisor, CONST_STRING(supervisor, "InstrumentOp"));
+    op         = Parrot_pmc_new_init(supervisor, op_type, instrument);
+
     runcore_library_update(supervisor, runcore);
+
+    /* Build a table mapping the bytecode's ops to the
+       list in the core_op_table. */
+    op_mapping = runcore_get_op_mappings(supervisor, interp);
+    SETATTR_InstrumentOp_op_mapping(supervisor, op, op_mapping);
 
     /* Setup exception handler to handle exits and unhandled exceptions. */
     if (setjmp(exc_handler.resume)) {
@@ -499,14 +508,14 @@ opcode_t* runcore_runcore_runops(PARROT_INTERP, Parrot_runcore_t *core_ptr, opco
         Parrot_pcc_set_pc(interp, CURRENT_CONTEXT(interp), pc);
 
         /* Get the list of callbacks to call and execute the op. */
-        callbacks = runcore_probes_get_probes(supervisor, runcore, *pc);
-        recalls   = runcore_probes_fire_probes(supervisor, runcore, pc, callbacks);
+        callbacks = runcore_probes_get_probes(supervisor, runcore, op_mapping[*pc]);
+        recalls   = runcore_probes_fire_probes(supervisor, runcore, op, pc, callbacks);
         DO_OP(pc, interp);
-        ignore    = runcore_probes_fire_probes(supervisor, runcore, pc_copy, recalls);
+        ignore    = runcore_probes_fire_probes(supervisor, runcore, op, pc_copy, recalls);
         probe_list_delete_list(supervisor, ignore);
 
         /* On loading a dynlib or bytecode, we need to update a few things. */
-        if (runcore_does_loading(pc_copy)) {
+        if (runcore_does_loading(op_mapping[*pc_copy])) {
             runcore_library_update(supervisor, runcore);
         }
 
@@ -515,7 +524,51 @@ opcode_t* runcore_runcore_runops(PARROT_INTERP, Parrot_runcore_t *core_ptr, opco
         Parrot_cx_handle_tasks(supervisor, supervisor->scheduler);
     }
 
+    /* Cleanup */
+    mem_gc_free(supervisor, op_mapping);
+
     return pc;
+}
+
+/*
+
+=item C<INTVAL* runcore_get_op_mappings(Parrot_Interp supervisor, Parrot_Interp interp);>
+
+With the merging of the dynop_mapping branch, the ops are now referenced
+from the packfile itself. The numbering of the ops there differ from that
+in the interpreter. So here we map back those op numbers to the one in the
+interpreter.
+
+For internal use only.
+
+=cut
+
+*/
+
+INTVAL* runcore_get_op_mappings(Parrot_Interp supervisor, Parrot_Interp interp) {
+    UINTVAL i;
+    PMC *oplib, *oplib_str;
+    op_info_t **op_info;
+    INTVAL *op_mapping;
+
+    op_info   = (interp->code->op_info_table);
+    oplib_str = Parrot_pmc_new(supervisor, enum_class_String);
+    VTABLE_set_string_native(supervisor, oplib_str, CONST_STRING(supervisor, "core_ops"));
+
+    oplib = Parrot_pmc_new_init(supervisor, enum_class_OpLib, oplib_str);
+
+    op_mapping = mem_gc_allocate_n_zeroed_typed(supervisor, interp->code->op_count, INTVAL);
+    for(i = 0; i < interp->code->op_count; i++) {
+        STRING *name;
+        INTVAL index;
+
+        name  = CONST_STRING(supervisor, (*(op_info[i])).full_name);
+        index = VTABLE_get_integer_keyed_str(supervisor, oplib, name);
+
+        op_mapping[i] = index;
+    }
+
+    return op_mapping;
 }
 
 /*
@@ -698,8 +751,7 @@ For internal use only.
 
 */
 
-INTVAL runcore_does_loading(opcode_t *pc) {
-    INTVAL op = *pc;
+INTVAL runcore_does_loading(INTVAL op) {
     return (op == enum_ops_loadlib_p_s
          || op == enum_ops_loadlib_p_sc
          || op == enum_ops_loadlib_p_s_p
